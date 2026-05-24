@@ -19,9 +19,11 @@ and run directly. Linux only.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -127,6 +129,27 @@ def list_interfaces() -> list[str]:
     return names
 
 
+def default_interface(interfaces: list[str]) -> Optional[str]:
+    """Pick the most sensible default interface, preferring Wi-Fi.
+
+    Strategy:
+      1. First interface that sysfs marks as wireless.
+      2. Otherwise, first interface whose name looks like Wi-Fi
+         (``wl*`` from predictable names or legacy ``wlan*``).
+      3. Otherwise, the last entry — on most Linux hosts ``ifconfig``/``ip``
+         lists Wi-Fi after Ethernet, matching the user's mental model.
+    """
+    if not interfaces:
+        return None
+    for n in interfaces:
+        if is_wireless(n):
+            return n
+    for n in interfaces:
+        if n.startswith(("wl", "wlan", "wlp")):
+            return n
+    return interfaces[-1]
+
+
 def read_iface_bytes(iface: str) -> tuple[int, int]:
     """Return ``(rx_bytes, tx_bytes)`` straight from sysfs."""
     base = Path(f"/sys/class/net/{iface}/statistics")
@@ -137,29 +160,6 @@ def read_iface_bytes(iface: str) -> tuple[int, int]:
 
 def is_wireless(iface: str) -> bool:
     return Path(f"/sys/class/net/{iface}/wireless").exists()
-
-
-def parse_iw_link(iface: str) -> dict[str, str]:
-    """Parse ``iw dev <iface> link`` into a flat dict. Empty if not associated."""
-    iw = shutil.which("iw")
-    if not iw:
-        return {}
-    try:
-        out = subprocess.run(
-            [iw, "dev", iface, "link"], capture_output=True, text=True, timeout=2
-        ).stdout
-    except (subprocess.SubprocessError, OSError) as exc:
-        log.debug("iw dev failed: %s", exc)
-        return {}
-    if "Not connected" in out:
-        return {}
-    fields: dict[str, str] = {}
-    for line in out.splitlines():
-        line = line.strip()
-        if ":" in line:
-            k, _, v = line.partition(":")
-            fields[k.strip()] = v.strip()
-    return fields
 
 
 def current_tc_qdisc(iface: str) -> str:
@@ -379,11 +379,14 @@ class ControlsPanel(QWidget):
 
     def populate_interfaces(self) -> None:
         current = self.iface_combo.currentText()
+        ifaces = list_interfaces()
         self.iface_combo.blockSignals(True)
         self.iface_combo.clear()
-        self.iface_combo.addItems(list_interfaces())
-        if current:
-            idx = self.iface_combo.findText(current)
+        self.iface_combo.addItems(ifaces)
+        # Restore prior selection if any; otherwise default to Wi-Fi.
+        target = current if current else (default_interface(ifaces) or "")
+        if target:
+            idx = self.iface_combo.findText(target)
             if idx >= 0:
                 self.iface_combo.setCurrentIndex(idx)
         self.iface_combo.blockSignals(False)
@@ -449,7 +452,7 @@ def _wrap(layout) -> QWidget:
 # Throughput tab (pyqtgraph)
 # --------------------------------------------------------------------------- #
 class ThroughputTab(QWidget):
-    WINDOW_S = 60
+    WINDOW_S = 300  # rolling history: last 5 minutes
 
     def __init__(self, get_iface):
         super().__init__()
@@ -462,14 +465,20 @@ class ThroughputTab(QWidget):
 
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
-        self.enable_chk = QCheckBox("Live update")
-        self.enable_chk.setChecked(True)
-        clear_btn = QPushButton("Reset")
-        clear_btn.clicked.connect(self._reset_history)
-        self.readout = QLabel("RX: —    TX: —")
+        reset_window_btn = QPushButton("Reset Window")
+        reset_window_btn.setToolTip(
+            "Re-frame the chart to show all retained data (does NOT erase samples)."
+        )
+        reset_window_btn.clicked.connect(self._reset_window)
+        reset_data_btn = QPushButton("Reset Data")
+        reset_data_btn.setToolTip(
+            "Clear all collected samples and restart the trace at t = 0."
+        )
+        reset_data_btn.clicked.connect(self._reset_data)
+        self.readout = QLabel("Downloading: —    Uploading: —")
         self.readout.setStyleSheet("font-family: monospace; font-size: 13px;")
-        controls.addWidget(self.enable_chk)
-        controls.addWidget(clear_btn)
+        controls.addWidget(reset_window_btn)
+        controls.addWidget(reset_data_btn)
         controls.addStretch(1)
         controls.addWidget(self.readout)
         layout.addLayout(controls)
@@ -480,9 +489,12 @@ class ThroughputTab(QWidget):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "Throughput", units="bit/s")
         self.plot.setLabel("bottom", "Time", units="s")
+        # Anchor the x-axis at t = 0 on launch; pyqtgraph will then auto-range
+        # as new samples arrive (and stop auto-ranging if the user pans/zooms).
+        self.plot.setXRange(0, self.WINDOW_S, padding=0)
         self.plot.addLegend()
-        self.rx_curve = self.plot.plot(pen=pg.mkPen("#5DADE2", width=2), name="RX")
-        self.tx_curve = self.plot.plot(pen=pg.mkPen("#F39C12", width=2), name="TX")
+        self.rx_curve = self.plot.plot(pen=pg.mkPen("#5DADE2", width=2), name="Downloading")
+        self.tx_curve = self.plot.plot(pen=pg.mkPen("#F39C12", width=2), name="Uploading")
         layout.addWidget(self.plot, 1)
 
         # Single, persistent timer — connect once.
@@ -491,7 +503,12 @@ class ThroughputTab(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start()
 
-    def _reset_history(self) -> None:
+    def _reset_window(self) -> None:
+        """Snap the view back to fit the retained data; keep samples intact."""
+        self.plot.enableAutoRange(axis="xy", enable=True)
+
+    def _reset_data(self) -> None:
+        """Erase all collected samples and restart at t = 0."""
         self._t.clear()
         self._rx.clear()
         self._tx.clear()
@@ -499,11 +516,11 @@ class ThroughputTab(QWidget):
         self._elapsed = 0
         self.rx_curve.setData([], [])
         self.tx_curve.setData([], [])
-        self.readout.setText("RX: —    TX: —")
+        self.readout.setText("Downloading: —    Uploading: —")
+        self.plot.setXRange(0, self.WINDOW_S, padding=0)
+        self.plot.enableAutoRange(axis="xy", enable=True)
 
     def _tick(self) -> None:
-        if not self.enable_chk.isChecked():
-            return
         iface = self._get_iface()
         if not iface:
             return
@@ -525,76 +542,8 @@ class ThroughputTab(QWidget):
         self.rx_curve.setData(list(self._t), list(self._rx))
         self.tx_curve.setData(list(self._t), list(self._tx))
         self.readout.setText(
-            f"RX: {fmt_rate(rx_rate):>12}    TX: {fmt_rate(tx_rate):>12}"
+            f"Downloading: {fmt_rate(rx_rate):>12}    Uploading: {fmt_rate(tx_rate):>12}"
         )
-
-
-# --------------------------------------------------------------------------- #
-# Quality tab
-# --------------------------------------------------------------------------- #
-class QualityTab(QWidget):
-    def __init__(self, get_iface):
-        super().__init__()
-        self._get_iface = get_iface
-
-        layout = QVBoxLayout(self)
-        self.banner = QLabel()
-        self.banner.setStyleSheet(
-            "background: #3a2f17; color: #f1c40f; padding: 8px; border-radius: 4px;"
-        )
-        self.banner.setWordWrap(True)
-        self.banner.hide()
-        layout.addWidget(self.banner)
-
-        self.form_box = QGroupBox("Wireless link")
-        form = QFormLayout(self.form_box)
-        self.ssid_lbl = QLabel("—")
-        self.freq_lbl = QLabel("—")
-        self.signal_lbl = QLabel("—")
-        self.bitrate_lbl = QLabel("—")
-        for lbl in (self.ssid_lbl, self.freq_lbl, self.signal_lbl, self.bitrate_lbl):
-            lbl.setStyleSheet("font-family: monospace;")
-        form.addRow("SSID:", self.ssid_lbl)
-        form.addRow("Frequency:", self.freq_lbl)
-        form.addRow("Signal:", self.signal_lbl)
-        form.addRow("TX bitrate:", self.bitrate_lbl)
-        layout.addWidget(self.form_box)
-        layout.addStretch(1)
-
-        self.timer = QTimer(self)
-        self.timer.setInterval(1500)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start()
-        self._tick()
-
-    def _tick(self) -> None:
-        iface = self._get_iface()
-        if not iface:
-            self.banner.setText("Select an interface to inspect link quality.")
-            self.banner.show()
-            self.form_box.setEnabled(False)
-            return
-        if not is_wireless(iface):
-            self.banner.setText(
-                f"<b>{iface}</b> is not a wireless interface — no signal data available."
-            )
-            self.banner.show()
-            self.form_box.setEnabled(False)
-            return
-        fields = parse_iw_link(iface)
-        if not fields:
-            self.banner.setText(
-                f"<b>{iface}</b> is wireless but not associated to an AP."
-            )
-            self.banner.show()
-            self.form_box.setEnabled(False)
-            return
-        self.banner.hide()
-        self.form_box.setEnabled(True)
-        self.ssid_lbl.setText(fields.get("SSID", "—"))
-        self.freq_lbl.setText(fields.get("freq", "—"))
-        self.signal_lbl.setText(fields.get("signal", "—"))
-        self.bitrate_lbl.setText(fields.get("tx bitrate", "—"))
 
 
 # --------------------------------------------------------------------------- #
@@ -606,7 +555,7 @@ PING_RTT_RE = re.compile(r"time[=<]([\d.]+)\s*ms")
 class VerifyTab(QWidget):
     """Run ``ping`` with QProcess and graph measured RTT / jitter / loss."""
 
-    WINDOW = 60
+    WINDOW = 300  # rolling history: last 5 minutes of samples
 
     def __init__(self, get_configured_summary):
         super().__init__()
@@ -641,6 +590,18 @@ class VerifyTab(QWidget):
         self.stop_btn.setEnabled(False)
         ctl.addWidget(self.stop_btn)
         ctl.addStretch(1)
+        self.reset_window_btn = QPushButton("Reset Window")
+        self.reset_window_btn.setToolTip(
+            "Re-frame the chart to show all retained samples (does NOT erase data)."
+        )
+        self.reset_window_btn.clicked.connect(self._reset_window)
+        ctl.addWidget(self.reset_window_btn)
+        self.reset_data_btn = QPushButton("Reset Data")
+        self.reset_data_btn.setToolTip(
+            "Erase all collected samples (RTT, loss, log) and restart at t = 0."
+        )
+        self.reset_data_btn.clicked.connect(self._reset)
+        ctl.addWidget(self.reset_data_btn)
         layout.addLayout(ctl)
 
         readout = QGroupBox("Configured vs measured")
@@ -661,8 +622,14 @@ class VerifyTab(QWidget):
         self.plot = pg.PlotWidget()
         self.plot.setBackground("#1e1f22")
         self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.setLabel("left", "RTT", units="ms")
+        # RTT is always in milliseconds — disable SI auto-prefix so the axis
+        # never silently turns into e.g. "kms" when RTTs grow large.
+        self.plot.setLabel("left", "RTT (ms)")
+        left_axis = self.plot.getAxis("left")
+        left_axis.enableAutoSIPrefix(False)
         self.plot.setLabel("bottom", "Ping #")
+        # Anchor x at 0 on launch; auto-range takes over as samples arrive.
+        self.plot.setXRange(0, self.WINDOW, padding=0)
         self.curve = self.plot.plot(pen=pg.mkPen("#2ecc71", width=2))
         layout.addWidget(self.plot, 1)
 
@@ -719,6 +686,12 @@ class VerifyTab(QWidget):
         self._elapsed = 0
         self.curve.setData([], [])
         self.log_view.clear()
+        self.plot.setXRange(0, self.WINDOW, padding=0)
+        self.plot.enableAutoRange(axis="xy", enable=True)
+
+    def _reset_window(self) -> None:
+        """Snap the view back to fit the retained data; keep samples intact."""
+        self.plot.enableAutoRange(axis="xy", enable=True)
 
     def _on_output(self) -> None:
         assert self.proc is not None
@@ -817,15 +790,19 @@ class MainWindow(QMainWindow):
         dock.setWidget(self.controls)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
 
+        # Every interface we have ever touched with `tc qdisc add` in this
+        # session. Used to guarantee cleanup on close/crash even if the user
+        # switched interfaces after applying a rule.
+        self._touched_ifaces: set[str] = set()
+
         self.tabs = QTabWidget()
         self.throughput_tab = ThroughputTab(self.controls.current_interface)
-        self.quality_tab = QualityTab(self.controls.current_interface)
         self.verify_tab = VerifyTab(self._configured_summary)
         self.preview_tab = CommandPreviewTab()
+        # Order: Monitoring → Throughput → Log Preview
+        self.tabs.addTab(self.verify_tab, "Monitoring")
         self.tabs.addTab(self.throughput_tab, "Throughput")
-        self.tabs.addTab(self.quality_tab, "Quality")
-        self.tabs.addTab(self.verify_tab, "Verify")
-        self.tabs.addTab(self.preview_tab, "Command Preview")
+        self.tabs.addTab(self.preview_tab, "Log Preview")
         self.setCentralWidget(self.tabs)
 
         self.status_label = QLabel("No netem rule applied.")
@@ -895,6 +872,7 @@ class MainWindow(QMainWindow):
 
         try:
             sudo_run(argv)
+            self._touched_ifaces.add(iface)
             log.info("applied: tc %s", " ".join(argv[1:]))
             Toast(self, f"Applied: {self._configured_summary()}")
         except SudoError as exc:
@@ -922,15 +900,35 @@ class MainWindow(QMainWindow):
         log.error(msg)
         Toast(self, msg, msec=5000)
 
-    def closeEvent(self, event) -> None:
+    def cleanup(self) -> None:
+        """Idempotent teardown: stop ping, strip netem from every touched iface
+        (plus the currently-selected one as a safety net)."""
+        if getattr(self, "_cleaned", False):
+            return
+        self._cleaned = True
         log.info("shutting down")
-        self.verify_tab.shutdown()
-        iface = self.controls.current_interface()
-        if iface and has_netem(iface):
+        try:
+            self.verify_tab.shutdown()
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            log.warning("verify_tab shutdown error: %s", exc)
+
+        ifaces = set(self._touched_ifaces)
+        current = self.controls.current_interface()
+        if current:
+            ifaces.add(current)
+        for iface in ifaces:
             try:
-                sudo_run(["tc", "qdisc", "del", "dev", iface, "root"])
+                if has_netem(iface):
+                    sudo_run(["tc", "qdisc", "del", "dev", iface, "root"])
+                    log.info("removed netem qdisc on %s", iface)
             except SudoError as exc:
-                log.warning("could not remove qdisc on exit: %s", exc.stderr or exc)
+                log.warning("could not remove qdisc on %s: %s",
+                            iface, exc.stderr or exc)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("cleanup error on %s: %s", iface, exc)
+
+    def closeEvent(self, event) -> None:
+        self.cleanup()
         super().closeEvent(event)
 
 
@@ -971,6 +969,22 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     win = MainWindow()
     win.show()
+
+    # Belt-and-braces cleanup: also fires on normal interpreter exit and on
+    # SIGINT/SIGTERM (Ctrl+C in the launching terminal, `kill <pid>`, etc.).
+    atexit.register(win.cleanup)
+
+    def _signal_quit(signum, _frame):
+        log.info("received signal %s, quitting", signum)
+        win.cleanup()
+        app.quit()
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _signal_quit)
+        except (ValueError, OSError):
+            pass  # e.g. SIGHUP missing on some platforms
+
     log.info("%s ready", APP_NAME)
     return app.exec()
 
