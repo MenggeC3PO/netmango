@@ -35,6 +35,7 @@ from typing import Optional
 import psutil
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, QProcess, QSize, Signal
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -57,10 +58,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-APP_NAME = "Netemango"
+APP_NAME = "Netmango"
 APP_SLUG = "delaymorph"
 LOG_PATH = Path.home() / ".local" / "share" / APP_SLUG / "app.log"
 STYLE_QSS = Path(__file__).resolve().parent.parent / "style.qss"
+ICON_PATH = Path(__file__).resolve().parent.parent / "assest" / "Netmango.png"
 
 log = logging.getLogger(APP_SLUG)
 
@@ -779,7 +781,10 @@ class CommandPreviewTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        # Window title is rendered by the OS title bar (often centered).
+        # The in-app header below already shows the brand, so leave the OS
+        # title empty to avoid the duplicate "Netmango" up top.
+        self.setWindowTitle("")
         self.resize(1180, 740)
 
         self.controls = ControlsPanel()
@@ -804,6 +809,28 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.throughput_tab, "Throughput")
         self.tabs.addTab(self.preview_tab, "Log Preview")
         self.setCentralWidget(self.tabs)
+
+        # --- Top header: logo + title, centered, hugging the top edge -----
+        header = QWidget()
+        header.setFixedHeight(24)
+        header.setContentsMargins(0, 0, 0, 0)
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
+        header_row.addStretch(1)
+        if ICON_PATH.is_file():
+            icon_lbl = QLabel()
+            pix = QPixmap(str(ICON_PATH))
+            if not pix.isNull():
+                icon_lbl.setPixmap(
+                    pix.scaledToHeight(19, Qt.SmoothTransformation)
+                )
+            header_row.addWidget(icon_lbl, 0, Qt.AlignVCenter)
+        title_lbl = QLabel(APP_NAME)
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: 600;")
+        header_row.addWidget(title_lbl, 0, Qt.AlignVCenter)
+        header_row.addStretch(1)
+        self.setMenuWidget(header)
 
         self.status_label = QLabel("No netem rule applied.")
         self.statusBar().addWidget(self.status_label, 1)
@@ -964,7 +991,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    app.setApplicationName(" ")
+    if ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     _load_qss(app)
 
     win = MainWindow()
