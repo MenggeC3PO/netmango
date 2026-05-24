@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assest/Netmango_fullname.png" alt="Netmango" width="420">
+  <img src="assest/Netmango_fullname.png" alt="Netmango" width="320">
 </p>
 
 <p align="center">
