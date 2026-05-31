@@ -33,9 +33,9 @@ Netmango is packaged on PyPI: install it with pip or run it straight from source
 
 ---
 
-## APP Screenshot
+## APP Screencast
 <p align="center">
-  <img src="assest/Software_ui.png" alt="Netmango_app" width="420">
+  <img src="assest/netmango.gif" alt="Netmango_app" width="420">
 </p>
 
 ---
